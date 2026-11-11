@@ -280,3 +280,23 @@ caption generation.
 - Base model: https://huggingface.co/HuggingFaceTB/SmolVLM2-256M-Video-Instruct
 
 See `docs/REFERENCE_METHOD.md` for the exact mapping between the reference method and this video adaptation.
+
+## Troubleshooting: `ModuleNotFoundError: badminton_decision.models`
+
+This repository uses a `src/` package layout. From the repository root, install
+it in editable mode before running the training commands:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+The test suite also includes `tests/conftest.py`, which adds the local `src/`
+directory to the test import path. If an older installation shadows the local
+checkout, verify the resolved package with:
+
+```bash
+python -c "import badminton_decision; print(badminton_decision.__file__)"
+```
+
+The expected path ends with `src/badminton_decision/__init__.py`.
