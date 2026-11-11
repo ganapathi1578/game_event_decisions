@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "badminton-jev-smolvlm2"
+version = "0.1.0"
+description = "Video multiple-choice decision model using SmolVLM2 and choice-order-invariant attention"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "transformers>=4.57.0,<5.0",
+  "peft>=0.14.0",
+  "accelerate>=1.2.0",
+  "huggingface_hub>=0.27.0",
+  "safetensors>=0.4.5",
+  "opencv-python-headless>=4.9.0",
+  "Pillow>=10.0.0",
+  "numpy>=1.26.0",
+  "PyYAML>=6.0.1",
+  "tqdm>=4.66.0",
+  "scikit-learn>=1.4.0",
+  "packaging>=24.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+
+[project.scripts]
+badminton-download = "badminton_decision.cli:download_main"
+badminton-inspect = "badminton_decision.cli:inspect_main"
+badminton-prepare = "badminton_decision.cli:prepare_main"
+badminton-train = "badminton_decision.cli:train_main"
+badminton-evaluate = "badminton_decision.cli:evaluate_main"
+badminton-predict = "badminton_decision.cli:predict_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

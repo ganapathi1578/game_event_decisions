@@ -1,0 +1,39 @@
+hit_type:
+  train:
+    - "Which badminton stroke is performed at the target hit?"
+    - "What type of hit does the player execute in this segment?"
+    - "Identify the stroke shown in the video."
+    - "Select the best category for the player's racket action."
+  validation:
+    - "Choose the stroke category that matches the observed hit."
+    - "What badminton shot is being played here?"
+  test:
+    - "From the clip, determine the kind of hit being executed."
+    - "Which stroke label best describes the target action?"
+subtype:
+  train:
+    - "Which subtype best describes the target stroke?"
+    - "Identify the fine-grained subtype of this hit."
+    - "Select the most specific stroke description."
+  validation:
+    - "What is the precise subtype of the observed stroke?"
+  test:
+    - "Which detailed stroke label fits this action?"
+hitter:
+  train:
+    - "Which side of the court performs the target hit?"
+    - "Is the target hit made by the top or bottom player?"
+    - "Identify the hitting player's court position."
+  validation:
+    - "Which player position executes the observed hit?"
+  test:
+    - "From the camera view, who hits the shuttle: top or bottom?"
+ball_area:
+  train:
+    - "Which court region does the shot target?"
+    - "Select the landing or target area for this hit."
+    - "Where is the shuttle directed on the court?"
+  validation:
+    - "Identify the target court area of the stroke."
+  test:
+    - "Which court zone best matches the intended shot area?"

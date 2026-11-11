@@ -1,0 +1,76 @@
+project:
+  seed: 42
+  output_dir: runs
+  data_dir: data/raw/finebadminton-20k
+  processed_dir: data/processed
+
+model:
+  name: HuggingFaceTB/SmolVLM2-256M-Video-Instruct
+  torch_dtype: float16          # RTX 2080 Ti: float16. Use bfloat16 only on supported GPUs.
+  attn_implementation: eager    # required for the custom 4D additive attention mask
+  gradient_checkpointing: true
+  trust_remote_code: false
+  local_files_only: false
+  freeze_vision_encoder: true
+
+video:
+  duration_seconds: 3.0
+  num_frames: 8
+  image_longest_edge: 512
+  temporal_jitter_seconds: 0.20
+  cache_size: 8
+
+choice:
+  min_options_train: 2
+  max_options_train: 8
+  max_options_eval: 16
+  shuffle_train_options: true
+  option_open_token: "<option>"
+  option_close_token: "</option>"
+  answer_prompt: "The answer is:"
+  task_prompt: "Choose the best option."
+  context_max_tokens: 160
+  option_max_tokens: 24
+
+lora:
+  enabled: true
+  r: 8
+  alpha: 16
+  dropout: 0.0
+  last_k_layers: 12
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+head:
+  hidden_dim: 512
+  num_layers: 2
+  num_task_types: 4
+
+training:
+  epochs: 3
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+  num_workers: 0
+  learning_rate_lora: 0.0001
+  learning_rate_head: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  logging_steps: 10
+  eval_steps: 1000
+  save_steps: 1000
+  mixed_precision: fp16
+  gradient_checkpointing: true
+  max_train_samples: null
+  max_eval_samples: null
+
+data:
+  train_ratio: 0.80
+  validation_ratio: 0.10
+  test_ratio: 0.10
+  min_class_count: 2
+  include_tasks: [hit_type, subtype, hitter, ball_area]
+
+evaluation:
+  permutation_trials: 5
+  report_calibration: true
+  max_samples: null
