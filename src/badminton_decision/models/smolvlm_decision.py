@@ -31,6 +31,53 @@ def lora_target_regex(num_layers: int, last_k_layers: int, targets: list[str]) -
     return rf".*layers\.({ids})\.self_attn\.({target_group})"
 
 
+def _group_legacy_visual_features(
+    image_features: torch.Tensor,
+    pixel_values: torch.Tensor,
+    hidden_dim: int,
+) -> list[torch.Tensor]:
+    """Restore per-example visual features from the Transformers 4.57 tensor API.
+
+    Transformers 4.57's ``SmolVLMModel.get_image_features`` returns a tensor shaped
+    ``[num_real_images, visual_tokens, hidden_dim]``. Newer releases return a
+    ``BaseModelOutputWithPooling`` whose ``pooler_output`` is already grouped by
+    example. The legacy API flattens the batch and image axes, so reconstruct the
+    groups using the same all-zero padded-image convention as Transformers.
+    """
+    if image_features.ndim != 3:
+        raise RuntimeError(
+            "Unsupported legacy SmolVLM visual feature shape "
+            f"{tuple(image_features.shape)}; expected [images, tokens, hidden]."
+        )
+    if image_features.shape[-1] != hidden_dim:
+        raise RuntimeError(
+            f"Visual feature width {image_features.shape[-1]} does not match decoder width {hidden_dim}."
+        )
+    if pixel_values.ndim != 5:
+        raise RuntimeError(
+            "Legacy SmolVLM feature grouping expects pixel_values shaped "
+            f"[batch, images, channels, height, width], got {tuple(pixel_values.shape)}."
+        )
+
+    batch_size, num_images = pixel_values.shape[:2]
+    values_per_image = pixel_values.shape[2:].numel()
+    valid_images = (pixel_values == 0).sum(dim=(-1, -2, -3)) != values_per_image
+    # Match Transformers 4.57's fallback for batches containing only padded images.
+    if not bool(valid_images.any()):
+        valid_images.reshape(-1)[0] = True
+    image_counts = [int(count) for count in valid_images.sum(dim=1).tolist()]
+    expected_images = sum(image_counts)
+    if expected_images != image_features.shape[0]:
+        raise RuntimeError(
+            "Cannot group legacy SmolVLM visual features: input contains "
+            f"{expected_images} real images across {batch_size} examples, but the encoder "
+            f"returned {image_features.shape[0]} image feature groups."
+        )
+
+    grouped = image_features.split(image_counts, dim=0)
+    return [features.reshape(-1, features.shape[-1]) for features in grouped]
+
+
 def merge_visual_features_into_context(
     context_embeds: torch.Tensor, context_ids: torch.Tensor,
     visual_features: torch.Tensor, image_token_id: int,
@@ -156,13 +203,29 @@ class SmolVLMChoiceModel(nn.Module):
         if pixel_attention_mask is not None:
             pixel_attention_mask = pixel_attention_mask.to(device=pixel_values.device, dtype=torch.bool)
         with torch.no_grad():
+            # Transformers 4.57 exposes get_image_features(pixel_values, pixel_attention_mask)
+            # and returns a flattened Tensor. Newer releases accept additional kwargs and
+            # return BaseModelOutputWithPooling. Omitting return_dict=True is compatible
+            # with both APIs; the model config defaults to structured outputs on newer versions.
             image_outputs = base_model.get_image_features(
                 pixel_values=pixel_values,
                 pixel_attention_mask=pixel_attention_mask,
-                return_dict=True,
             )
-        # SmolVLM returns one flattened [frames * visual_tokens, hidden] tensor per batch item.
-        features = image_outputs.pooler_output
+
+        # Transformers 4.57 returns [real_images, visual_tokens, hidden] directly.
+        # Newer releases return an output object with pooler_output grouped by example.
+        if isinstance(image_outputs, torch.Tensor):
+            return _group_legacy_visual_features(image_outputs, pixel_values, self.hidden_dim)
+        if isinstance(image_outputs, tuple):
+            # A return-dict-disabled BaseModelOutputWithPooling is tuple-ordered as
+            # (last_hidden_state, pooler_output, ...); prefer the grouped pooler output.
+            if len(image_outputs) > 1:
+                image_outputs = image_outputs[1]
+            elif image_outputs:
+                image_outputs = image_outputs[0]
+            else:
+                raise RuntimeError("SmolVLM returned an empty tuple for visual features.")
+        features = getattr(image_outputs, "pooler_output", image_outputs)
         if isinstance(features, torch.Tensor):
             if features.ndim == 3:
                 return [features[i] for i in range(features.shape[0])]
