@@ -1,7 +1,6 @@
 data/raw/
 data/processed/
 data/cache/
-models/
 runs/
 checkpoints/
 *.log
