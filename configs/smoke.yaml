@@ -19,6 +19,9 @@ video:
   temporal_jitter_seconds: 0.0
   cache_size: 2
 
+visual_cache:
+  enabled: false
+
 choice:
   min_options_train: 2
   max_options_train: 4

@@ -20,6 +20,9 @@ generation.
 - The reference decision layout: `<option>` markers, shared option position starts, independent option attention blocks,
   final answer prompt, reference-style choice head, bilinear option scores, and cross-entropy over options.
 - LoRA rank 8 / alpha 16 on the last 12 text decoder layers by default.
+- Offline event-level visual feature extraction to a disk-backed NumPy memory map, shared across task-specific QA rows.
+- GPU-aware extraction micro-batching with automatic CUDA-OOM backoff and resumable completed-event tracking.
+- Batched BEV/Jev-style text decoding with one independent option-block attention mask per sample.
 - Training, checkpoint save/load, validation, test evaluation, permutation consistency evaluation, and interactive inference.
 - Unit tests for the mask, positional reset, choice-head permutation equivariance, data parsing, and split integrity.
 
@@ -167,15 +170,49 @@ The tests verify:
 - the answer block can attend to all previous options;
 - the choice head is permutation-equivariant when option embeddings are permuted.
 
-## 6. Train
+## 6. Offline visual extraction, then train
 
-Single GPU:
+The default configuration uses a two-stage workflow. First, extract the frozen vision tower + connector features **once per unique event**. The four task QA rows generated for an event all reuse the same visual feature row. Extraction is a separate process and writes to:
+
+```text
+data/cache/visual_features/
+├── features.npy       # FP16 [unique_events, visual_tokens, hidden_dim], disk-backed memmap
+├── completed.npy      # per-event completion bitmap; supports resume
+├── index.json         # event_id -> row mapping
+└── metadata.json      # model and extraction settings
+```
+
+The feature file is read on demand; all visual embeddings are not loaded into GPU memory or copied into RAM at once. Keep this cache on Colab's local `/content` disk for faster random reads. The cache can be regenerated after a runtime reset. The default extraction batch is selected from currently free GPU memory and is halved automatically if CUDA runs out of memory. On a T4, extraction normally starts with a small micro-batch; the actual value is printed at startup.
+
+Run extraction after preparing the manifests:
 
 ```bash
-accelerate launch --num_processes 1 scripts/train.py \
+python scripts/extract_visual_features.py --config configs/default.yaml
+```
+
+If extraction is interrupted, run the same command again. Completed events are skipped. To discard the old cache and rebuild it:
+
+```bash
+python scripts/extract_visual_features.py --config configs/default.yaml --force
+```
+
+Then start fine-tuning. Training opens the existing cache and fails early with an instruction if required train/validation events are missing; it does not silently re-extract features:
+
+```bash
+accelerate launch --num_processes 1 --mixed_precision fp16 scripts/train.py \
   --config configs/default.yaml \
   --name badminton-smolvlm2-r8-k12
 ```
+
+For a one-command preparation + extraction + training flow, `bash scripts/quickstart.sh --train` runs extraction before launching training.
+
+The decoder batch size is separately selected from free GPU memory after estimating the model-weight footprint. For a measured choice on your exact T4/session, run the optional forward/backward benchmark:
+
+```bash
+python scripts/benchmark_training_batches.py --config configs/default.yaml --batch-sizes 1,2,4,8 --steps 3
+```
+
+It reports peak allocated VRAM and examples/second for each successful batch size, and writes `runs/batch_benchmark.json`. Set `training.per_device_batch_size` to the best safe integer from that report. Gradient accumulation remains independent of this per-device micro-batch.
 
 Two GPUs (e.g. two RTX 2080 Ti devices):
 
@@ -193,13 +230,14 @@ The default settings are deliberately conservative:
 - LoRA on q/k/v/o projections in the last 12 of 30 text decoder layers.
 - Choice head hidden dimension 512, two attention blocks.
 - Eight frames per three-second clip.
-- Per-device batch 1, gradient accumulation 32.
+- GPU-aware per-device decoder batch, gradient accumulation 32.
+- Frozen vision features cached offline in FP16; temporal jitter is disabled for this deterministic cache baseline.
 - FP16 and gradient checkpointing.
 - Three epochs, LoRA LR 1e-4, head LR 1e-3.
 
-With one GPU, the effective batch is 32. With two GPUs under Accelerate/DDP, it is 64. If the 2080 Ti runs out of
-memory, edit `configs/default.yaml` and set `video.num_frames: 4`. Do not start by changing the choice mask or
-sequence layout.
+The effective batch is `per-device batch × gradient accumulation × number of GPUs`. If the decoder runs out of
+memory, first set `training.per_device_batch_size: 1`; if that is still insufficient, set `video.num_frames: 4`,
+then re-extract the cache with `--force`. Do not change the option mask or sequence layout to address VRAM pressure.
 
 Training writes the config, metrics and checkpoints to `runs/<name>/`. The `best`, `latest`, and `final`
 checkpoints contain only LoRA adapter weights, choice-head weights and metadata; the base SmolVLM2 weights are

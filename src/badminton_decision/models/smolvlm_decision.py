@@ -245,70 +245,151 @@ class SmolVLMChoiceModel(nn.Module):
                 )
         return features
 
-    def _one_forward(self, visual_features: torch.Tensor, context_ids: torch.Tensor,
-                     option_ids: list[torch.Tensor], task_type_id: int) -> torch.Tensor:
-        device = visual_features.device
+    def _build_decoder_sequence(
+        self,
+        visual_features: torch.Tensor,
+        context_ids: torch.Tensor,
+        option_ids: list[torch.Tensor],
+    ):
+        """Build one context/options/answer sequence and its independent attention layout."""
         text_model = self.vlm.model.text_model
+        device = next(text_model.parameters()).device
         embedding = text_model.get_input_embeddings()
-        context_ids = context_ids.to(device)
+        context_ids = context_ids.to(device=device, dtype=torch.long)
         context_embeds = embedding(context_ids)
-        # Match SmolVLM's native multimodal merge while preserving the image markers.
+        visual_features = visual_features.to(device=device, dtype=context_embeds.dtype)
         context_embeds = merge_visual_features_into_context(
             context_embeds, context_ids, visual_features, self.image_token_id
         )
-        option_embeddings = []
-        option_tokens_list: list[list[int]] = []
+
+        option_token_lists: list[list[int]] = []
+        chunks = [context_embeds]
         for tokens in option_ids:
-            tokens = tokens.to(device)
-            option_tokens_list.append(tokens.tolist())
+            token_list = tokens.detach().to(device="cpu", dtype=torch.long).tolist()
+            if not token_list:
+                raise ValueError("An option tokenized to an empty sequence")
+            option_token_lists.append(token_list)
+            full_ids = self.option_open_ids + token_list + self.option_close_ids
+            chunks.append(embedding(torch.tensor(full_ids, dtype=torch.long, device=device)))
+
+        answer_ids = torch.tensor(self.answer_prompt_ids, dtype=torch.long, device=device)
+        chunks.append(embedding(answer_ids))
         layout = build_choice_layout(
             context_length=context_embeds.shape[0],
-            option_token_ids=option_tokens_list,
+            option_token_ids=option_token_lists,
             option_open_ids=self.option_open_ids,
             option_close_ids=self.option_close_ids,
             answer_token_ids=self.answer_prompt_ids,
         )
-        chunks = [context_embeds]
-        for option_tokens in option_ids:
-            option_full = self.option_open_ids + option_tokens.tolist() + self.option_close_ids
-            ids = torch.tensor(option_full, dtype=torch.long, device=device)
-            option_embeddings.append(embedding(ids))
-            chunks.append(option_embeddings[-1])
-        answer_ids = torch.tensor(self.answer_prompt_ids, dtype=torch.long, device=device)
-        chunks.append(embedding(answer_ids))
-        inputs_embeds = torch.cat(chunks, dim=0).unsqueeze(0)
-        position_ids = layout.position_ids.to(device).unsqueeze(0)
-        additive_mask = to_additive_mask(layout.allowed_attention.to(device), dtype=inputs_embeds.dtype)
-        hidden = text_model(
+        return torch.cat(chunks, dim=0), layout
+
+    def _batched_text_forward(
+        self,
+        visual_features: list[torch.Tensor],
+        context_ids: list[torch.Tensor],
+        option_ids: list[list[torch.Tensor]],
+        task_type_ids: list[str] | list[int],
+    ) -> torch.Tensor:
+        """Run one padded decoder call with an independent option mask per example."""
+        batch_lengths = {len(visual_features), len(context_ids), len(option_ids), len(task_type_ids)}
+        if len(batch_lengths) != 1:
+            raise ValueError("Visual features, contexts, options and task IDs must share a batch size")
+        if not visual_features:
+            raise ValueError("Cannot run an empty decision batch")
+
+        sequences: list[torch.Tensor] = []
+        layouts = []
+        for visual, context, options in zip(visual_features, context_ids, option_ids):
+            sequence, layout = self._build_decoder_sequence(visual, context, options)
+            sequences.append(sequence)
+            layouts.append(layout)
+
+        batch_size = len(sequences)
+        max_length = max(int(sequence.shape[0]) for sequence in sequences)
+        hidden_dim = int(sequences[0].shape[-1])
+        device, dtype = sequences[0].device, sequences[0].dtype
+        inputs_embeds = torch.zeros((batch_size, max_length, hidden_dim), device=device, dtype=dtype)
+        position_ids = torch.zeros((batch_size, max_length), device=device, dtype=torch.long)
+        allowed_attention = torch.zeros(
+            (batch_size, max_length, max_length), device=device, dtype=torch.bool
+        )
+
+        for index, (sequence, layout) in enumerate(zip(sequences, layouts)):
+            length = int(sequence.shape[0])
+            inputs_embeds[index, :length] = sequence
+            position_ids[index, :length] = layout.position_ids.to(device=device)
+            allowed_attention[index, :length, :length] = layout.allowed_attention.to(device=device)
+            # Padded query rows attend only to themselves; valid tokens cannot attend to padding.
+            if length < max_length:
+                padding = torch.arange(length, max_length, device=device)
+                allowed_attention[index, padding, padding] = True
+
+        additive_mask = to_additive_mask(allowed_attention, dtype=inputs_embeds.dtype)
+        decoder_outputs = self.vlm.model.text_model(
             inputs_embeds=inputs_embeds,
             attention_mask=additive_mask,
             position_ids=position_ids,
             use_cache=False,
             return_dict=True,
-        ).last_hidden_state.float()
-        choice_indices = layout.choice_read_indices.to(device)
-        choice_embeddings = hidden[:, choice_indices, :]
-        answer_embedding = hidden[:, layout.answer_end_index, :]
-        task_tensor = torch.tensor([task_type_id], device=device, dtype=torch.long)
-        choice_mask = torch.ones((1, len(option_ids)), device=device, dtype=torch.bool)
-        with torch.autocast(device_type=device.type, enabled=False):
-            logits = self.head(choice_embeddings.float(), answer_embedding.float(), choice_mask, task_tensor)
-        return logits[0]
+        )
+        hidden = decoder_outputs.last_hidden_state
 
-    def forward(self, pixel_values: torch.Tensor, pixel_attention_mask: torch.Tensor | None,
-                context_ids: list[torch.Tensor], option_ids: list[list[torch.Tensor]],
-                task_type_ids: list[str] | list[int], **kwargs) -> torch.Tensor:
-        visual_features = self._encode_visual(pixel_values, pixel_attention_mask)
-        logits_list = []
-        for index, visual in enumerate(visual_features):
-            task = task_type_ids[index]
-            task_id = TASK_TYPES[task] if isinstance(task, str) else int(task)
-            logits_list.append(self._one_forward(visual, context_ids[index], option_ids[index], task_id))
-        max_choices = max(logit.numel() for logit in logits_list)
-        output = torch.full((len(logits_list), max_choices), -torch.inf, device=logits_list[0].device)
-        for i, logits in enumerate(logits_list):
-            output[i, :logits.numel()] = logits
-        return output
+        max_choices = max(len(layout.choice_read_indices) for layout in layouts)
+        choice_hidden = hidden.new_zeros((batch_size, max_choices, hidden_dim))
+        choice_mask = torch.zeros((batch_size, max_choices), dtype=torch.bool, device=device)
+        answer_hidden = hidden.new_zeros((batch_size, hidden_dim))
+        for index, layout in enumerate(layouts):
+            count = len(layout.choice_read_indices)
+            read_indices = layout.choice_read_indices.to(device=device)
+            choice_hidden[index, :count] = hidden[index].index_select(0, read_indices)
+            choice_mask[index, :count] = True
+            answer_hidden[index] = hidden[index, layout.answer_end_index]
+
+        task_ids = [TASK_TYPES[item] if isinstance(item, str) else int(item) for item in task_type_ids]
+        task_tensor = torch.tensor(task_ids, device=device, dtype=torch.long)
+        # Keep the choice head in FP32 when the decoder is running under FP16 autocast.
+        with torch.autocast(device_type=device.type, enabled=False):
+            return self.head(
+                choice_hidden.float(), answer_hidden.float(), choice_mask, task_tensor
+            )
+
+    def _one_forward(
+        self,
+        visual_features: torch.Tensor,
+        context_ids: torch.Tensor,
+        option_ids: list[torch.Tensor],
+        task_type_id: int,
+    ) -> torch.Tensor:
+        """Backward-compatible single-example helper."""
+        return self._batched_text_forward(
+            [visual_features], [context_ids], [option_ids], [task_type_id]
+        )[0, :len(option_ids)]
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        pixel_attention_mask: torch.Tensor | None = None,
+        context_ids: list[torch.Tensor] | None = None,
+        option_ids: list[list[torch.Tensor]] | None = None,
+        task_type_ids: list[str] | list[int] | None = None,
+        visual_features: torch.Tensor | list[torch.Tensor] | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if context_ids is None or option_ids is None or task_type_ids is None:
+            raise ValueError("context_ids, option_ids and task_type_ids are required")
+        if visual_features is None:
+            if pixel_values is None:
+                raise ValueError("Supply either cached visual_features or raw pixel_values")
+            grouped_features = self._encode_visual(pixel_values, pixel_attention_mask)
+        elif isinstance(visual_features, torch.Tensor):
+            if visual_features.ndim != 3:
+                raise ValueError(
+                    "Batched cached visual_features must have shape [batch, visual_tokens, hidden_dim]"
+                )
+            grouped_features = [visual_features[index] for index in range(visual_features.shape[0])]
+        else:
+            grouped_features = list(visual_features)
+        return self._batched_text_forward(grouped_features, context_ids, option_ids, task_type_ids)
 
     def trainable_parameter_counts(self) -> dict[str, int]:
         lora_params = 0

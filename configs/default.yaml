@@ -17,8 +17,21 @@ video:
   duration_seconds: 3.0
   num_frames: 8
   image_longest_edge: 512
-  temporal_jitter_seconds: 0.20
+  # One deterministic temporal view is cached per event. This avoids a train-time
+  # cache miss for the same event across its four QA tasks.
+  temporal_jitter_seconds: 0.0
   cache_size: 8
+
+visual_cache:
+  enabled: true
+  directory: data/cache/visual_features
+  # GPU-aware extraction starts conservatively and halves the micro-batch on CUDA OOM.
+  extraction_batch_size: auto
+  max_extraction_batch_size: 8
+  memory_fraction: 0.50
+  reserve_gib: 2.5
+  estimated_gib_per_event: 1.5
+  feature_dtype: float16
 
 choice:
   min_options_train: 2
@@ -47,7 +60,13 @@ head:
 
 training:
   epochs: 3
-  per_device_batch_size: 1
+  # Select decoder batch from free VRAM after estimating the model's weight footprint.
+  per_device_batch_size: auto
+  max_auto_batch_size: 8
+  auto_batch_reserve_gib: 4.0
+  # Conservative estimate; a 16 GB T4 will normally start with micro-batch 2.
+  # Use scripts/benchmark_training_batches.py to tune for the current runtime.
+  auto_batch_estimated_gib_per_example: 4.0
   gradient_accumulation_steps: 32
   num_workers: 0
   learning_rate_lora: 0.0001

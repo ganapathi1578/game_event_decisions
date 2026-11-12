@@ -50,3 +50,16 @@ def test_choice_read_index_matches_closing_marker_end():
     layout = make_layout([2, 3])
     for read_idx, (_, end) in zip(layout.choice_read_indices.tolist(), layout.option_spans):
         assert read_idx == end - 1
+
+
+def test_batched_additive_mask_preserves_independent_example_masks():
+    first = make_layout([2, 2]).allowed_attention
+    second = make_layout([3]).allowed_attention
+    max_len = max(first.shape[0], second.shape[0])
+    batched = torch.zeros((2, max_len, max_len), dtype=torch.bool)
+    batched[0, : first.shape[0], : first.shape[1]] = first
+    batched[1, : second.shape[0], : second.shape[1]] = second
+    mask = to_additive_mask(batched)
+    assert mask.shape == (2, 1, max_len, max_len)
+    assert torch.isfinite(mask[0, 0, : first.shape[0], : first.shape[1]][first]).all()
+    assert torch.isneginf(mask[0, 0, : first.shape[0], : first.shape[1]][~first]).all()

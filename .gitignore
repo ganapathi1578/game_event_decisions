@@ -1,11 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training outputs
+runs/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+
+# Dataset and generated cache
 data/raw/
 data/processed/
 data/cache/
-runs/
-checkpoints/
+*.npy
+*.npz
+*.mmap
+
+# Logs
 *.log
-__pycache__/
-.pytest_cache/
-.venv/
+logs/
+
+# Temporary patch files
+*.rej
+*.orig
+
+# Environment variables
 .env
-.DS_Store
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/

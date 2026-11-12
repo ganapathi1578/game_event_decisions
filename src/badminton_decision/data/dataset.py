@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from badminton_decision.data.video import VideoFrameReader
+from badminton_decision.data.feature_cache import VisualFeatureCache
 from badminton_decision.utils import read_jsonl
 
 
@@ -65,7 +66,8 @@ class ChoiceVideoDataset(Dataset):
     def __init__(self, manifest_path: str | Path, video_root: str | Path, split: str,
                  num_frames: int = 8, duration_seconds: float = 3.0, cache_size: int = 8,
                  jitter_seconds: float = 0.2, min_options: int = 2, max_options: int = 8,
-                 shuffle_options: bool = True, max_samples: int | None = None, seed: int = 42):
+                 shuffle_options: bool = True, max_samples: int | None = None, seed: int = 42,
+                 feature_cache: VisualFeatureCache | None = None):
         self.rows = read_jsonl(manifest_path)
         if max_samples is not None:
             self.rows = self.rows[:max_samples]
@@ -74,8 +76,10 @@ class ChoiceVideoDataset(Dataset):
         self.training = split == "train"
         self.min_options = min_options
         self.max_options = max_options
+        self.num_frames = int(num_frames)
         self.shuffle_options = shuffle_options and self.training
-        self.reader = VideoFrameReader(
+        self.feature_cache = feature_cache
+        self.reader = None if feature_cache is not None else VideoFrameReader(
             num_frames=num_frames,
             duration_seconds=duration_seconds,
             cache_size=cache_size,
@@ -91,7 +95,15 @@ class ChoiceVideoDataset(Dataset):
         video_path = Path(row["video_path"])
         if not video_path.is_absolute():
             video_path = self.video_root / video_path
-        frames = self.reader.read(video_path, row["target_frame"], row["fps"], training=self.training)
+        if self.feature_cache is None:
+            frames = self.reader.read(video_path, row["target_frame"], row["fps"], training=self.training)
+            visual_features = None
+            duration_seconds = float(self.reader.duration_seconds)
+        else:
+            # The same event-level visual embedding is reused across all task QA rows.
+            frames = None
+            visual_features = self.feature_cache.get(str(row["event_id"]))
+            duration_seconds = float(row.get("clip_duration_seconds", 3.0))
         full_options = list(row["options"])
         answer = row["answer"]
         if answer not in full_options:
@@ -110,7 +122,9 @@ class ChoiceVideoDataset(Dataset):
             "sample_id": row["sample_id"],
             "match_id": row["match_id"],
             "frames": frames,
-            "duration_seconds": self.reader.duration_seconds,
+            "visual_features": visual_features,
+            "duration_seconds": duration_seconds,
+            "num_frames": self.num_frames,
             "question": question,
             "options": selected,
             "correct_index": selected.index(answer),
@@ -122,13 +136,15 @@ class ChoiceVideoDataset(Dataset):
 
 class DecisionCollator:
     def __init__(self, processor, context_max_tokens: int = 160, option_max_tokens: int = 24,
-                 task_prompt: str = "Choose the best option.", image_longest_edge: int = 512):
+                 task_prompt: str = "Choose the best option.", image_longest_edge: int = 512,
+                 use_visual_cache: bool = False):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.context_max_tokens = context_max_tokens
         self.option_max_tokens = option_max_tokens
         self.task_prompt = task_prompt
         self.image_longest_edge = int(image_longest_edge)
+        self.use_visual_cache = bool(use_visual_cache)
         # SmolVLM2's stock image processor may tile a 720p frame into several 512px
         # crops (default longest edge is larger). For the short-clip training recipe,
         # enforce one 512px-longest-edge view per frame to keep visual-token count and
@@ -171,17 +187,33 @@ class DecisionCollator:
         return pixel_values, pixel_mask
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
-        processed = [self._process_frames(ex["frames"]) for ex in examples]
-        shapes = {tuple(pv.shape) for pv, _ in processed}
-        if len(shapes) != 1:
-            raise ValueError(f"All processed video frames in a batch must have equal shapes; found {shapes}. Use batch size 1.")
-        pixel_values = torch.stack([pv for pv, _ in processed], dim=0)
-        pixel_attention_mask = torch.stack([pm for _, pm in processed], dim=0)
+        visual_features = None
+        pixel_values = None
+        pixel_attention_mask = None
+        if self.use_visual_cache:
+            feature_shapes = {tuple(ex["visual_features"].shape) for ex in examples}
+            if len(feature_shapes) != 1:
+                raise ValueError(
+                    "Cached visual features in a batch must have equal shapes; "
+                    f"found {feature_shapes}. Rebuild the cache with a fixed frame/image configuration."
+                )
+            visual_features = torch.stack([ex["visual_features"] for ex in examples], dim=0)
+        else:
+            processed = [self._process_frames(ex["frames"]) for ex in examples]
+            shapes = {tuple(pv.shape) for pv, _ in processed}
+            if len(shapes) != 1:
+                raise ValueError(
+                    f"All processed video frames in a batch must have equal shapes; found {shapes}. "
+                    "Use a fixed image size or batch size 1."
+                )
+            pixel_values = torch.stack([pv for pv, _ in processed], dim=0)
+            pixel_attention_mask = torch.stack([pm for _, pm in processed], dim=0)
 
         context_ids, option_ids = [], []
         for ex in examples:
+            num_frames = int(ex.get("num_frames", len(ex["frames"]) if ex.get("frames") is not None else 0))
             context_ids.append(build_smolvlm_context_ids(
-                self.tokenizer, self.processor, num_frames=len(ex["frames"]),
+                self.tokenizer, self.processor, num_frames=num_frames,
                 duration_seconds=float(ex.get("duration_seconds", 3.0)),
                 question=ex["question"], task_prompt=self.task_prompt,
                 context_max_tokens=self.context_max_tokens,
@@ -194,6 +226,7 @@ class DecisionCollator:
         return {
             "pixel_values": pixel_values,
             "pixel_attention_mask": pixel_attention_mask,
+            "visual_features": visual_features,
             "context_ids": context_ids,
             "option_ids": option_ids,
             "correct_index": torch.tensor([ex["correct_index"] for ex in examples], dtype=torch.long),

@@ -34,7 +34,18 @@ if [[ "$PREPARE" == "1" ]]; then
     --config "$CONFIG" --templates configs/question_templates.yaml --seed 42
 fi
 if [[ "$TRAIN" == "1" ]]; then
-  accelerate launch scripts/train.py --config "$CONFIG" --name "$RUN_NAME"
+  CACHE_ENABLED="$(python - "$CONFIG" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("true" if config.get("visual_cache", {}).get("enabled", False) else "false")
+PY
+)"
+  if [[ "$CACHE_ENABLED" == "true" ]]; then
+    python scripts/extract_visual_features.py --config "$CONFIG"
+  fi
+  accelerate launch --num_processes 1 scripts/train.py --config "$CONFIG" --name "$RUN_NAME"
 else
   echo "Data preparation complete. Add --train to start fine-tuning."
 fi

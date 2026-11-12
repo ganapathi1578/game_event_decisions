@@ -90,9 +90,19 @@ def build_choice_layout(
 
 
 def to_additive_mask(allowed_attention: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Convert True/False allowed mask to [1, 1, L, L] additive mask."""
-    if allowed_attention.ndim != 2 or allowed_attention.shape[0] != allowed_attention.shape[1]:
-        raise ValueError("allowed_attention must be square [L, L]")
-    mask = torch.zeros(allowed_attention.shape, dtype=dtype, device=allowed_attention.device)
-    mask = mask.masked_fill(~allowed_attention, float("-inf"))
-    return mask.unsqueeze(0).unsqueeze(0)
+    """Convert allowed-attention masks to additive 4D masks for eager attention.
+
+    Accepts one ``[L,L]`` mask and returns ``[1,1,L,L]``, or a batch of independent
+    ``[B,L,L]`` masks and returns ``[B,1,L,L]``.
+    """
+    if allowed_attention.ndim == 2:
+        if allowed_attention.shape[0] != allowed_attention.shape[1]:
+            raise ValueError("allowed_attention must be square [L, L]")
+        mask = torch.zeros(allowed_attention.shape, dtype=dtype, device=allowed_attention.device)
+        return mask.masked_fill(~allowed_attention, float("-inf")).unsqueeze(0).unsqueeze(0)
+    if allowed_attention.ndim == 3:
+        if allowed_attention.shape[1] != allowed_attention.shape[2]:
+            raise ValueError("batched allowed_attention must have shape [B, L, L]")
+        mask = torch.zeros(allowed_attention.shape, dtype=dtype, device=allowed_attention.device)
+        return mask.masked_fill(~allowed_attention, float("-inf")).unsqueeze(1)
+    raise ValueError("allowed_attention must have shape [L, L] or [B, L, L]")
